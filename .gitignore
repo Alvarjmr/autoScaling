@@ -1,0 +1,33 @@
+# ==============================================================================
+# Terraform
+# ==============================================================================
+**/.terraform/
+.terraform/
+.terraform.lock.hcl
+
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# ==============================================================================
+# Variables de Entorno, Llaves y Sistema Operativo
+# ==============================================================================
+.env
+.env.*
+*.pem
+*.zip
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+__pycache__/
+*.pyc

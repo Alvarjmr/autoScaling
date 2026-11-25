@@ -1,0 +1,10 @@
+aws_region              = "us-east-1"
+project_name            = "autoscaling-web"
+environment             = "prod"
+instance_type           = "t3.micro"
+min_size                = 1
+max_size                = 4
+desired_capacity        = 1
+scale_out_cpu_threshold = 50
+scale_in_cpu_threshold  = 20
+alarm_period_seconds    = 300

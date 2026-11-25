@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS Auto Scaling & Load Balancing Lab (Nginx + t3.micro)</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div>
+        <span class="badge-env">AWS FREE TIER · t3.micro · ASG [1 → 4]</span>
+        <h1>AWS Auto Scaling &amp; Load Balancing Lab</h1>
+        <p class="subtitle">
+          Demostración visual en vivo sobre Nginx + Application Load Balancer + CloudWatch Alarms
+        </p>
+      </div>
+      <div class="hero-status" id="currentInstanceBadge">
+        <span class="dot"></span>
+        <span>Conectado vía ALB</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container main-grid">
+    <!-- KPIs de Arquitectura -->
+    <section class="kpi-row">
+      <div class="kpi-card">
+        <span class="kpi-label">Límites Auto Scaling</span>
+        <strong class="kpi-value">Min 1 / Max 4</strong>
+        <span class="kpi-sub">Instancias EC2 t3.micro (Capa Gratuita)</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Instancias Detectadas</span>
+        <strong class="kpi-value" id="kpiInstances">0</strong>
+        <span class="kpi-sub">Activas respondiendo detrás del ALB</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Alarma Scale-Out</span>
+        <strong class="kpi-value text-amber">CPU &ge; 50% / &ge; 75%</strong>
+        <span class="kpi-sub">+1 o +3 instancias (hasta 4) · 5m</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Alarma Scale-In</span>
+        <strong class="kpi-value text-cyan">CPU &le; 20%</strong>
+        <span class="kpi-sub">-1 / -2 instancias (hasta 1) · 2x5m</span>
+      </div>
+    </section>
+
+    <!-- Panel 1: Prueba de Estrés -->
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2>1. Prueba de Estrés (Disparar Alarmas de Auto Scaling)</h2>
+          <p class="muted">
+            Satura los 2 vCPUs de las instancias <code>t3.micro</code> al ~100% y mantiene pulsos vía ALB para que las nuevas instancias también reciban carga hasta alcanzar el límite superior (4).
+          </p>
+        </div>
+        <span class="status-pill" id="stressStateBadge">Inactivo</span>
+      </div>
+
+      <div class="controls-row">
+        <label class="select-wrap">
+          <span>Duración de la prueba:</span>
+          <select id="stressDuration">
+            <option value="360" selected>6 minutos (Recomendado para alarma 5m)</option>
+            <option value="600">10 minutos (Prueba extendida)</option>
+            <option value="180">3 minutos (Prueba corta)</option>
+          </select>
+        </label>
+
+        <button id="btnStartStress" class="btn btn-danger">
+          🔥 Iniciar Prueba de Estrés (Subir a 4)
+        </button>
+
+        <button id="btnStopStress" class="btn btn-secondary" disabled>
+          🛑 Detener Estrés (Permitir Scale-In a 1)
+        </button>
+      </div>
+
+      <div class="stress-banner" id="stressBanner">
+        Presiona <strong>"Iniciar Prueba de Estrés"</strong> para elevar el uso de CPU. Al superar el umbral de CloudWatch, el Auto Scaling Group lanzará nuevas instancias hasta <strong>4</strong>. Cuando presiones <strong>"Detener Estrés"</strong>, la CPU caerá por debajo del 20% y escalará hacia abajo hasta <strong>1</strong>.
+      </div>
+    </section>
+
+    <!-- Panel 2: Prueba Visual de Balanceo de Carga -->
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2>2. Prueba Visual de Balanceo de Carga (ALB Round-Robin)</h2>
+          <p class="muted">
+            Envía ráfagas de peticiones HTTP sin caché al Application Load Balancer para comprobar visualmente cómo reparte el tráfico entre todas las instancias saludables.
+          </p>
+        </div>
+        <div class="live-toggle">
+          <label class="switch-label">
+            <input type="checkbox" id="toggleAutoPoll" checked />
+            <span>🔄 Monitoreo en vivo (2s)</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="controls-row">
+        <label class="select-wrap">
+          <span>Peticiones por ráfaga:</span>
+          <select id="burstCount">
+            <option value="20">20 peticiones</option>
+            <option value="40" selected>40 peticiones</option>
+            <option value="80">80 peticiones</option>
+          </select>
+        </label>
+
+        <button id="btnRunLoadTest" class="btn btn-primary">
+          ⚡ Ejecutar Prueba de Balanceo
+        </button>
+
+        <button id="btnResetStats" class="btn btn-ghost">
+          🧹 Reiniciar Contadores
+        </button>
+      </div>
+
+      <!-- Barra Proporcional de Distribución -->
+      <div class="dist-wrapper">
+        <div class="dist-header">
+          <span>Distribución de Tráfico por Instancia</span>
+          <span id="totalHitsLabel" class="muted">0 peticiones registradas</span>
+        </div>
+        <div class="stacked-bar" id="stackedBar">
+          <div class="stacked-empty">Esperando peticiones...</div>
+        </div>
+      </div>
+
+      <!-- Tarjetas de Instancias -->
+      <div class="fleet-grid" id="fleetGrid"></div>
+
+      <!-- Flujo visual de peticiones -->
+      <div class="stream-wrapper">
+        <div class="dist-header">
+          <span>Últimas Peticiones Atendidas (Tiempo Real)</span>
+          <span class="muted">Cada color identifica una instancia EC2 distinta</span>
+        </div>
+        <div class="request-pills" id="requestPills"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer container">
+    <span>Desplegado automáticamente vía GitHub Actions OIDC + Terraform · Nginx + ALB + EC2 Auto Scaling</span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

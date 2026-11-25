@@ -1,0 +1,52 @@
+#!/bin/bash
+set -euxo pipefail
+
+# bundle_hash=${bundle_hash}
+dnf install -y nginx awscli
+
+mkdir -p /opt/autoscaling-web
+aws s3 cp "s3://${assets_bucket}/web/agent.py" /opt/autoscaling-web/agent.py --region "${aws_region}"
+aws s3 cp "s3://${assets_bucket}/web/index.html" /usr/share/nginx/html/index.html --region "${aws_region}"
+aws s3 cp "s3://${assets_bucket}/web/styles.css" /usr/share/nginx/html/styles.css --region "${aws_region}"
+aws s3 cp "s3://${assets_bucket}/web/app.js" /usr/share/nginx/html/app.js --region "${aws_region}"
+
+chmod +x /opt/autoscaling-web/agent.py
+
+cat <<'EOF' > /etc/systemd/system/autoscaling-agent.service
+[Unit]
+Description=Auto Scaling Local CPU & Metadata Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/autoscaling-web/agent.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+mkdir -p /etc/nginx/default.d
+cat <<'EOF' > /etc/nginx/default.d/autoscaling.conf
+location = /health {
+    proxy_pass http://127.0.0.1:8080/health;
+    proxy_http_version 1.1;
+}
+
+location /api/ {
+    proxy_pass http://127.0.0.1:8080/api/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+}
+
+location = /index.html {
+    add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+}
+EOF
+
+systemctl daemon-reload
+systemctl enable --now autoscaling-agent
+systemctl enable --now nginx

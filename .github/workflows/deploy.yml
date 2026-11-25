@@ -1,0 +1,184 @@
+name: CI/CD Pipeline - AWS Auto Scaling & Nginx Load Balancing
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write # Autenticación OIDC sin llaves permanentes (reutiliza bootstrap de agentes)
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_STATE_KEY: "autoscaling/prod/terraform.tfstate"
+
+jobs:
+  deploy-infrastructure:
+    name: "1. Despliegue de Infraestructura (Terraform)"
+    runs-on: ubuntu-latest
+    outputs:
+      alb_url: ${{ steps.tf_outputs.outputs.alb_url }}
+      alb_dns_name: ${{ steps.tf_outputs.outputs.alb_dns_name }}
+      asg_name: ${{ steps.tf_outputs.outputs.asg_name }}
+      target_group_arn: ${{ steps.tf_outputs.outputs.target_group_arn }}
+      cpu_high_alarm_name: ${{ steps.tf_outputs.outputs.cpu_high_alarm_name }}
+      cpu_low_alarm_name: ${{ steps.tf_outputs.outputs.cpu_low_alarm_name }}
+
+    steps:
+      - name: Checkout del Repositorio
+        uses: actions/checkout@v4
+
+      - name: Validar Secreto OIDC de AWS
+        run: |
+          if [ -z "${{ secrets.AWS_ROLE_TO_ASSUME }}" ]; then
+            echo "::error title=Falta Secreto AWS_ROLE_TO_ASSUME::Configura el secreto AWS_ROLE_TO_ASSUME con el ARN del rol OIDC creado por el bootstrap de agentes."
+            exit 1
+          fi
+
+      - name: Autenticación en AWS mediante OIDC (Zero-Keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Descubrir Bucket de Estado Compartido (Bootstrap de agentes)
+        id: discover_backend
+        run: |
+          BUCKET="${{ vars.TF_STATE_BUCKET }}"
+          if [ -z "$BUCKET" ]; then
+            BUCKET=$(aws s3api list-buckets \
+              --query "Buckets[?starts_with(Name, 'citas-escolares-tfstate-')].Name | [0]" \
+              --output text)
+          fi
+          if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+            echo "::error title=Backend S3 no encontrado::No se encontró el bucket citas-escolares-tfstate-* del bootstrap de agentes."
+            exit 1
+          fi
+          echo "Usando bucket remoto compartido: $BUCKET"
+          echo "state_bucket=$BUCKET" >> $GITHUB_OUTPUT
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.4"
+
+      - name: Inicializar Terraform con Backend Compartido
+        working-directory: ./terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.discover_backend.outputs.state_bucket }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      - name: Validar Sintaxis de Terraform
+        working-directory: ./terraform
+        run: terraform validate
+
+      - name: Aplicar Infraestructura (Terraform Apply)
+        working-directory: ./terraform
+        run: terraform apply -auto-approve
+
+      - name: Exportar Variables de Salida
+        id: tf_outputs
+        working-directory: ./terraform
+        run: |
+          echo "alb_url=$(terraform output -raw alb_url)" >> $GITHUB_OUTPUT
+          echo "alb_dns_name=$(terraform output -raw alb_dns_name)" >> $GITHUB_OUTPUT
+          echo "asg_name=$(terraform output -raw autoscaling_group_name)" >> $GITHUB_OUTPUT
+          echo "target_group_arn=$(terraform output -raw target_group_arn)" >> $GITHUB_OUTPUT
+          echo "cpu_high_alarm_name=$(terraform output -raw cpu_high_alarm_name)" >> $GITHUB_OUTPUT
+          echo "cpu_low_alarm_name=$(terraform output -raw cpu_low_alarm_name)" >> $GITHUB_OUTPUT
+
+      - name: Esperar Instancia Saludable en Target Group del ALB
+        run: |
+          TG_ARN="${{ steps.tf_outputs.outputs.target_group_arn }}"
+          echo "Esperando a que al menos 1 instancia t3.micro esté 'healthy' en $TG_ARN..."
+          for i in {1..30}; do
+            HEALTHY=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TG_ARN" \
+              --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+              --output text)
+            echo "Intento $i/30: Instancias saludables = $HEALTHY"
+            if [ "${HEALTHY:-0}" -ge 1 ]; then
+              echo "✅ Instancia saludable registrada en el ALB."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "❌ Ninguna instancia alcanzó estado healthy tras 5 minutos."
+          exit 1
+
+  verify-deployment:
+    name: "2. Verificación Web Nginx, ASG y Alarmas"
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+
+    steps:
+      - name: Autenticación en AWS mediante OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Verificar Página Web Nginx y Endpoint /api/info vía ALB
+        run: |
+          ALB_URL="${{ needs.deploy-infrastructure.outputs.alb_url }}"
+          echo "Probando $ALB_URL ..."
+
+          HTTP_CODE=$(curl -s -o /tmp/index.html -w "%{http_code}" "$ALB_URL/")
+          echo "GET / -> HTTP $HTTP_CODE"
+          [ "$HTTP_CODE" -eq 200 ] || exit 1
+          grep -q "AWS Auto Scaling" /tmp/index.html
+
+          HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ALB_URL/health")
+          echo "GET /health -> HTTP $HEALTH_CODE"
+          [ "$HEALTH_CODE" -eq 200 ] || exit 1
+
+          echo "Ejecutando mini prueba de balanceo (5 peticiones a /api/info):"
+          for i in {1..5}; do
+            curl -s "$ALB_URL/api/info"
+            echo ""
+          done
+
+      - name: Validar Límites del ASG (Min 1 / Max 4 / t3.micro) y Alarmas CloudWatch
+        run: |
+          ASG_NAME="${{ needs.deploy-infrastructure.outputs.asg_name }}"
+          HIGH_ALARM="${{ needs.deploy-infrastructure.outputs.cpu_high_alarm_name }}"
+          LOW_ALARM="${{ needs.deploy-infrastructure.outputs.cpu_low_alarm_name }}"
+
+          ASG_INFO=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].{Min:MinSize,Max:MaxSize,Desired:DesiredCapacity,Instances:length(Instances)}" \
+            --output json)
+          echo "Estado ASG: $ASG_INFO"
+
+          MIN=$(echo "$ASG_INFO" | jq -r '.Min')
+          MAX=$(echo "$ASG_INFO" | jq -r '.Max')
+          [ "$MIN" -eq 1 ] && [ "$MAX" -eq 4 ]
+
+          ALARMS_INFO=$(aws cloudwatch describe-alarms \
+            --alarm-names "$HIGH_ALARM" "$LOW_ALARM" \
+            --query "MetricAlarms[].{Name:AlarmName,State:StateValue,Threshold:Threshold,Period:Period}" \
+            --output table)
+          echo "$ALARMS_INFO"
+
+      - name: Generar Resumen en GitHub Summary
+        run: |
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          ## 🚀 Despliegue de Auto Scaling AWS Completado
+
+          | Recurso | Configuración / Valor |
+          |---|---|
+          | **URL Web Nginx (ALB)** | ${{ needs.deploy-infrastructure.outputs.alb_url }} |
+          | **Auto Scaling Group** | `${{ needs.deploy-infrastructure.outputs.asg_name }}` (Min: `1`, Max: `4`, `t3.micro`) |
+          | **Alarma Scale-Out** | `${{ needs.deploy-infrastructure.outputs.cpu_high_alarm_name }}` (`CPU >= 50% / 75%`) |
+          | **Alarma Scale-In** | `${{ needs.deploy-infrastructure.outputs.cpu_low_alarm_name }}` (`CPU <= 20%`) |
+
+          > Abre la URL del ALB para ejecutar visualmente la **Prueba de Estrés** y la **Prueba de Balanceo de Carga**.
+          EOF
